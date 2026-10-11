@@ -278,7 +278,7 @@ jobs:
               "gamemode": cfg["gamemode"],
               "difficulty": cfg["difficulty"],
               "allow-cheats": "true" if cfg["allow_cheats"] else "false",
-              "online-mode": "false",
+              "online-mode": "true",
               "content-log-file-enabled": "true",
           }
           path = "bds/server.properties"
