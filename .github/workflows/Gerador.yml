@@ -14,6 +14,7 @@
 #   Confirmação (obrigatória, em até 2 min após o start): console.warn("[PREGEN] START ...")
 #   Progresso (opcional, aparece no log): console.warn("[PREGEN] PROGRESS 120/10000")
 #   Fim (obrigatório): console.warn("[PREGEN] DONE")
+#   Erro fatal (opcional): console.warn("[PREGEN] ABORT motivo") faz o workflow falhar na hora
 #
 # DISPARO POR ISSUE (label "gerar-mundo", só OWNER/MEMBER/COLLABORATOR)
 #   Corpo da issue com um bloco JSON, por exemplo:
@@ -218,27 +219,39 @@ jobs:
       - name: Baixar o Bedrock Dedicated Server
         run: |
           set -euo pipefail
+          # O site da Mojang bloqueia user-agents de script, então usamos um de navegador.
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
           VERSION=$(jq -r .bds_version "$CONFIG")
 
           if [ "$VERSION" = "latest" ]; then
-            PAGE=$(curl -fsSL -A "$UA" -H "Accept-Language: en" \
-              "https://www.minecraft.net/en-us/download/server/bedrock" || true)
-            VERSION=$(grep -oE 'bin-linux/bedrock-server-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.zip' <<<"$PAGE" \
-              | head -1 | sed -E 's/.*server-(.*)\.zip/\1/' || true)
-            if [ -z "$VERSION" ]; then
-              echo "::error::Não consegui descobrir a versão mais recente (o site pode bloquear o runner). Informe bds_version explicitamente."
+            # API oficial de links de download (a página HTML do site não serve mais para isso)
+            API="https://net-secondary.web.minecraft-services.net/api/v1.0/download/links"
+            JSON=$(curl -fsSL --retry 3 -A "$UA" "$API" || true)
+            URL=$(jq -r '.result.links[]? | select(.downloadType == "serverBedrockLinux") | .downloadUrl' <<<"$JSON" 2>/dev/null | head -n 1 || true)
+            if [ -z "$URL" ]; then
+              echo "::error::Não consegui obter a versão mais recente pela API da Mojang. Informe bds_version explicitamente."
+              echo "Resposta da API (início): ${JSON:0:300}"
               exit 1
             fi
+            VERSION=$(sed -E 's/.*bedrock-server-(.*)\.zip/\1/' <<<"$URL")
+          else
+            URL="https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-${VERSION}.zip"
+          fi
+
+          # Valida antes de usar (o valor vem de fora do repositório)
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || ! [[ "$URL" =~ ^https://www\.minecraft\.net/bedrockdedicatedserver/bin-linux/bedrock-server-[0-9.]+\.zip$ ]]; then
+            echo "::error::Versão ou URL inesperada: $VERSION / $URL"
+            exit 1
           fi
 
           echo "BDS_VERSION=$VERSION" >> "$GITHUB_ENV"
-          URL="https://www.minecraft.net/bedrockdedicatedserver/bin-linux/bedrock-server-${VERSION}.zip"
           echo "Baixando BDS $VERSION"
-          curl -fL --retry 3 -A "$UA" -o bds.zip "$URL" || {
-            echo "::error::Falha ao baixar $URL. Confira a versão ou se o site está bloqueando o runner (403)."
+          echo "URL: $URL"
+          HTTP=$(curl -sL --retry 3 -A "$UA" -o bds.zip -w '%{http_code}' "$URL" || true)
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::Falha ao baixar o BDS (HTTP $HTTP). Confira se a versão $VERSION existe ou se o site está bloqueando o runner (403)."
             exit 1
-          }
+          fi
           mkdir bds
           unzip -q bds.zip -d bds
           chmod +x bds/bedrock_server
@@ -391,6 +404,12 @@ jobs:
           LAST=""
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             if grep -q "\[PREGEN\] DONE" server.log; then DONE=1; break; fi
+            if grep -q "\[PREGEN\] ABORT" server.log; then
+              echo "::error::O addon abortou a pré-geração:"
+              grep "\[PREGEN\] ABORT" server.log | tail -n 3
+              tail -n 40 server.log
+              exit 1
+            fi
             if ! kill -0 "$SERVER_PID" 2>/dev/null; then
               echo "::error::O servidor encerrou antes de a pré-geração terminar."
               tail -n 60 server.log
